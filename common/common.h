@@ -96,6 +96,7 @@ enum llama_example {
     LLAMA_EXAMPLE_FIT_PARAMS,
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
+    LLAMA_EXAMPLE_NGRAM_BUILD,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -331,6 +332,16 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    std::string ngram_mod_cache; // path to persistent ngram-mod binary file (empty = disabled)
+    std::string model_path;      // model path for cache validation
+    std::string tokenizer_name;  // tokenizer model name (e.g. "llama", "gpt2")
+
+    // Minimum confidence threshold for n-gram entries (0.0-1.0)
+    // Entries with confidence below this are skipped during drafting.
+    // 0.0 = disabled (no filtering), 1.0 = only accept 100% confident entries
+    // Default: 0.3 (skip entries below 30% confidence)
+    float ngram_mod_min_confidence = 0.3f;
 };
 
 struct common_params_speculative_ngram_map {

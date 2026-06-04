@@ -893,6 +893,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    friend void common_speculative_print_stats(const common_speculative * spec);
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -902,18 +904,61 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // n-gram contexts used during last draft (flat buffer, each context is n tokens)
+        std::vector<common_ngram_mod::entry_t> draft_contexts;
+        size_t draft_contexts_count = 0;
+
+        // rejected contexts from last draft (flat buffer, each context is n tokens)
+        std::vector<common_ngram_mod::entry_t> rejected_contexts;
+        size_t rejected_contexts_count = 0;
     };
 
     std::vector<seq_info> sinfos;
+
+    // cumulative statistics
+    size_t n_inc_total = 0;       // total frequency increments (correct predictions)
+    size_t n_dec_total = 0;       // total frequency decrements (wrong predictions)
+    size_t n_evicted_total = 0;   // total entries evicted (freq < -20)
+    size_t n_learned_total = 0;   // total entries learned from reject-then-learn
 
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , mod(1, 1) // dummy, will be replaced below
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+
+        LOG_INF("ngram-mod ctor: model_path='%s'\n",
+                this->params.model_path.c_str());
+        const std::string & cache_path = this->params.ngram_mod_cache;
+
+        if (!cache_path.empty()) {
+            try {
+                // Validate cache metadata before loading the full data
+                if (!common_ngram_mod_validate(cache_path, this->params.model_path, this->params.tokenizer_name,
+                                                 this->params.n_match, this->params.n_max, this->params.n_min)) {
+                    LOG_WRN("%s: cache file validation failed for %s, creating fresh\n",
+                            __func__, cache_path.c_str());
+                    mod = common_ngram_mod(this->params.n_match, 4*1024*1024);
+                } else {
+                    std::string loaded_model_path;
+                    std::string loaded_tokenizer_name;
+                    int32_t loaded_n_match = 0, loaded_n_max = 0, loaded_n_min = 0;
+                    auto loaded = common_ngram_mod_load(cache_path, &loaded_model_path, &loaded_tokenizer_name,
+                                                          &loaded_n_match, &loaded_n_max, &loaded_n_min);
+                    mod.swap(loaded);
+                    LOG_INF("%s: loaded ngram-mod from %s\n", __func__, cache_path.c_str());
+                }
+            } catch (...) {
+                LOG_WRN("%s: failed to load ngram-mod from %s, creating fresh\n", __func__, cache_path.c_str());
+                mod = common_ngram_mod(this->params.n_match, 4*1024*1024);
+            }
+        } else {
+            mod = common_ngram_mod(this->params.n_match, 4*1024*1024);
+        }
 
         LOG_INF("%s: adding speculative implementation 'ngram-mod'\n", __func__);
         LOG_INF("%s: - n_match=%d, n_max=%d, n_min=%d\n", __func__,
@@ -927,6 +972,23 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+    }
+
+    ~common_speculative_impl_ngram_mod() {
+        if (!this->params.ngram_mod_cache.empty()) {
+            try {
+                common_ngram_mod_save(mod, this->params.ngram_mod_cache, this->params.model_path,
+                                        this->params.tokenizer_name,
+                                        this->params.n_match, this->params.n_max, this->params.n_min);
+                LOG_INF("%s: saved ngram-mod to %s (model: %s, tokenizer: %s, n_match=%d, n_max=%d, n_min=%d)\n",
+                        __func__, this->params.ngram_mod_cache.c_str(),
+                        this->params.model_path.empty() ? "unknown" : this->params.model_path.c_str(),
+                        this->params.tokenizer_name.empty() ? "unknown" : this->params.tokenizer_name.c_str(),
+                        this->params.n_match, this->params.n_max, this->params.n_min);
+            } catch (...) {
+                LOG_WRN("%s: failed to save ngram-mod to %s\n", __func__, this->params.ngram_mod_cache.c_str());
+            }
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -949,11 +1011,14 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const double f = (double)mod.get_used() / (double)mod.size();
         LOG_INF("%s: ngram_mod occupancy = %zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), f);
 
-        constexpr double f_thold = 0.25;
+        constexpr double f_thold = 0.5;
         if (f > f_thold) {
-            LOG_WRN("%s: ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", __func__, f, f_thold);
+            LOG_WRN("%s: ngram_mod occupancy %.2f exceeds threshold (%.2f) - pruning\n", __func__, f, f_thold);
 
-            mod.reset();
+            const size_t removed = mod.prune(0.15);
+            LOG_INF("%s: pruned %zu entries, new occupancy = %zu/%zu (%.2f)\n", __func__,
+                    removed, mod.get_used(), mod.size(),
+                    (double)mod.get_used() / (double)mod.size());
         }
     }
 
@@ -983,23 +1048,70 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
+        // Reject-then-learn: add correct n-grams for previously rejected predictions
+        // The rejected context is the n-gram that predicted wrong. The correct token
+        // is now in the prompt (added after the previous draft was evaluated).
+        // Reconstruct: correct_ngram = rejected_context + correct_token from prompt.
+        if (sinfo.rejected_contexts_count > 0 && cur_len > n) {
+            const size_t new_token_count = cur_len - sinfo.i_last - n;
+            for (size_t j = 0; j < sinfo.rejected_contexts_count && j < new_token_count; ++j) {
+                // Build correct n-gram: context (n tokens) + correct token (1 token)
+                std::vector<common_ngram_mod::entry_t> correct_ngram(n + 1);
+                const common_ngram_mod::entry_t * rctx = sinfo.rejected_contexts.data() + j * n;
+                std::copy(rctx, rctx + n, correct_ngram.begin());
+                // The correct token is the new token from the prompt
+                correct_ngram[n] = prompt[cur_len - (size_t)(sinfo.rejected_contexts_count - j)];
+                mod.add(correct_ngram.data());
+                n_learned_total++;
+            }
+        }
+        sinfo.rejected_contexts_count = 0;
+
         result.resize(n + params.n_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
+        // Save n-gram contexts for inc/dec tracking
+        sinfo.draft_contexts_count = 0;
+        sinfo.draft_contexts.resize(n * (size_t)params.n_max);
+
         for (int i = 0; i < params.n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
+            std::copy(result.data() + i, result.data() + i + n,
+                      sinfo.draft_contexts.data() + i * n);
+            sinfo.draft_contexts_count++;
+
             if (token == common_ngram_mod::EMPTY) {
                 if (i < params.n_min) {
                     result.clear();
+                    sinfo.draft_contexts_count = 0;
                     return;
                 }
 
                 result.resize(n + i);
+                sinfo.draft_contexts_count = i;
                 break;
             }
+
+            // Skip low-confidence entries
+            const size_t hash_idx = mod.idx(result.data() + i);
+            if (params.ngram_mod_min_confidence > 0.0f) {
+                const float conf = mod.confidence(hash_idx);
+                if (conf < params.ngram_mod_min_confidence) {
+                    if (i < params.n_min) {
+                        result.clear();
+                        sinfo.draft_contexts_count = 0;
+                        return;
+                    }
+
+                    result.resize(n + i);
+                    sinfo.draft_contexts_count = i;
+                    break;
+                }
+            }
+
             result[n + i] = token;
         }
 
@@ -1040,15 +1152,56 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
+            const common_ngram_mod::entry_t * contexts = sinfo.draft_contexts.data();
+            const size_t ctx_n = mod.get_n();
+
+            // Increment frequency for accepted n-grams (correct predictions)
+            // Earlier positions (closer to prompt) are more reliable → higher weight
+            // Position 0: +3, position 1: +2, position 2+: +1
+            for (uint16_t i = 0; i < n_accepted && i < (uint16_t)sinfo.draft_contexts_count; ++i) {
+                const int weight = std::max(1, 3 - (int)i);
+                for (int w = 0; w < weight; ++w) {
+                    mod.inc(contexts + i * ctx_n);
+                    n_inc_total++;
+                }
+            }
+
+            // Decrement frequency for rejected n-grams (wrong predictions)
+            // Later positions (further from prompt) are less reliable → higher penalty
+            // First rejection: -1, second: -2, third+: -3
+            // Also save rejected contexts for reject-then-learn
+            sinfo.rejected_contexts_count = 0;
+            sinfo.rejected_contexts.resize(ctx_n * (sinfo.draft_contexts_count - n_accepted));
+            for (uint16_t i = n_accepted; i < (uint16_t)sinfo.draft_contexts_count; ++i) {
+                const int weight = std::min(3, (int)(i - n_accepted + 1));
+                for (int w = 0; w < weight; ++w) {
+                    mod.dec(contexts + i * ctx_n);
+                    n_dec_total++;
+                }
+                std::copy(contexts + i * ctx_n, contexts + (i + 1) * ctx_n,
+                          sinfo.rejected_contexts.data() + sinfo.rejected_contexts_count * ctx_n);
+                sinfo.rejected_contexts_count++;
+            }
+
+            // Evict entries with frequency below -20 (consistently wrong predictions)
+            const size_t evicted = mod.prune_evict_negative(-20);
+            n_evicted_total += evicted;
+            if (evicted > 0 && verbose) {
+                LOG_INF("%s: evicted %zu entries with freq < -20\n", __func__, evicted);
+            }
+
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
             if (f_acc < 0.25) {
                 sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
+                if (sinfo.n_low >= 10) {
                     if (verbose) {
-                        LOG_WRN("%s: low acceptance streak (%d) - resetting ngram_mod\n", __func__, sinfo.n_low);
+                        LOG_WRN("%s: low acceptance streak (%d) - pruning ngram_mod (keeping top 30%% by freq)\n", __func__, sinfo.n_low);
                     }
 
-                    mod.reset();
+                    const size_t removed = mod.prune_keep_top(0.30);
+                    LOG_INF("%s: pruned %zu entries, remaining = %zu/%zu (%.2f%%)\n", __func__,
+                            removed, mod.get_used(), mod.size(),
+                            (double)mod.get_used() / (double)mod.size() * 100);
                     sinfo.n_low = 0;
                     sinfo.i_last = 0;
                 }
@@ -1056,6 +1209,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 sinfo.n_low = 0;
             }
         }
+
+        sinfo.draft_contexts_count = 0;
     }
 
     bool need_embd() const override {
@@ -1675,13 +1830,40 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_perf = "";
         }
 
-        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s\n",
+        const double acc_pct = impl->n_gen_tokens > 0
+            ? (double)impl->n_acc_tokens / (double)impl->n_gen_tokens * 100.0
+            : 0.0;
+
+        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu (%5.1f%%)%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
                 impl->n_acc_drafts,
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
+                acc_pct,
                 str_perf.c_str());
+
+        // ngram-mod specific statistics
+        if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+            const auto * ngram_impl = static_cast<const common_speculative_impl_ngram_mod *>(impl.get());
+            const auto & mod = ngram_impl->mod;
+
+            int32_t min_freq = 0, max_freq = 0;
+            int64_t sum_freq = 0;
+            mod.get_freq_stats(&min_freq, &max_freq, &sum_freq);
+            double avg_freq = mod.get_used() > 0 ? (double)sum_freq / (double)mod.get_used() : 0.0;
+            double occupancy = (double)mod.get_used() / (double)mod.size() * 100.0;
+
+            LOG_INF("statistics %16s: occupancy = %6.2f%% (%zu/%zu), freq: min=%6d max=%6d avg=%8.2f, "
+                    "inc=%zu dec=%zu evicted=%zu learned=%zu\n",
+                    "ngram-mod (detail)",
+                    occupancy, mod.get_used(), mod.size(),
+                    min_freq, max_freq, avg_freq,
+                    ngram_impl->n_inc_total,
+                    ngram_impl->n_dec_total,
+                    ngram_impl->n_evicted_total,
+                    ngram_impl->n_learned_total);
+        }
     }
 }

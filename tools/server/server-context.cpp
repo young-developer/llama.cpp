@@ -1054,6 +1054,16 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
+                // pass model path and tokenizer name for ngram-mod cache validation
+                SRV_INF("DEBUG: setting ngram_mod.model_path from params_base.model.path='%s' (len=%zu)\n",
+                        params_base.model.path.c_str(), params_base.model.path.size());
+                params_base.speculative.ngram_mod.model_path = params_base.model.path;
+                {
+                    char tk_buf[128];
+                    if (llama_model_meta_val_str(llama_get_model(ctx_tgt), "tokenizer.ggml.model", tk_buf, sizeof(tk_buf)) > 0) {
+                        params_base.speculative.ngram_mod.tokenizer_name = tk_buf;
+                    }
+                }
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());

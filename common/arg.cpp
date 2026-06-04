@@ -3683,6 +3683,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--ngram-mod-cache"}, "FNAME",
+        "path to persistent ngram-mod binary file (saved on shutdown, loaded on startup)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.ngram_mod_cache = value;
+        }
+  ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-min-confidence"}, "F",
+        string_format("minimum confidence threshold for ngram-mod entries (0.0-1.0, default: %.1f, 0.0=disabled)",
+                      params.speculative.ngram_mod.ngram_mod_min_confidence),
+        [](common_params & params, const std::string & value) {
+            float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("ngram-mod min confidence must be between 0.0 and 1.0");
+            }
+            params.speculative.ngram_mod.ngram_mod_min_confidence = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
