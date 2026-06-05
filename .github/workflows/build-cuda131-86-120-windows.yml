@@ -78,7 +78,7 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl "llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-x64.zip" .\build\bin\Release\ggml-cuda.dll
+          7z a -snl "llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-x64.zip"  .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
