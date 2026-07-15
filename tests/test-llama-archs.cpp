@@ -346,6 +346,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
@@ -410,6 +411,9 @@ static bool arch_supported(const llm_arch arch) {
         return false; // TODO tensor shapes
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
+        return false;
+    }
+    if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
 
